@@ -36,15 +36,12 @@ Usage:
     crawl_data = web_crawl_tool("example.com", "Find contact information")
 """
 
-#TODO: Search Capabilities over the scraped pages
-#TODO: Store the pages in something
-#TODO: Tool to see what pages are available/saved to search over
-
 import json
 import logging
 import os
 import re
 import asyncio
+import time
 from typing import List, Dict, Any, Optional
 from firecrawl import Firecrawl
 from agent.auxiliary_client import async_call_llm
@@ -672,14 +669,18 @@ async def web_extract_tool(
                 # Choose content based on requested format
                 chosen_content = content_markdown if (format == "markdown" or (format is None and content_markdown)) else content_html or content_markdown or ""
                 
+                page_url = metadata.get("sourceURL", url)
                 results.append({
-                    "url": metadata.get("sourceURL", url),
+                    "url": page_url,
                     "title": title,
                     "content": chosen_content,
                     "raw_content": chosen_content,
                     "metadata": metadata  # Now guaranteed to be a dict
                 })
-                
+                # Cache the raw content for later listing/searching
+                if chosen_content:
+                    _store_page(page_url, title, chosen_content)
+
             except Exception as scrape_err:
                 logger.debug("Scrape failed for %s: %s", url, scrape_err)
                 results.append({
@@ -985,6 +986,9 @@ async def web_crawl_tool(
                 "raw_content": content,
                 "metadata": metadata  # Now guaranteed to be a dict
             })
+            # Cache the raw content for later listing/searching
+            if content:
+                _store_page(page_url, title, content)
 
         response = {"results": pages}
         
@@ -1100,6 +1104,154 @@ async def web_crawl_tool(
         _debug.save()
         
         return json.dumps({"error": error_msg}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# In-session page cache — populated by web_extract_tool and web_crawl_tool
+# so the agent can list and search previously scraped content without
+# making additional network requests.
+# ---------------------------------------------------------------------------
+
+_page_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _store_page(url: str, title: str, content: str) -> None:
+    """Store a scraped page in the in-memory session cache."""
+    _page_cache[url] = {
+        "url": url,
+        "title": title,
+        "content": content,
+        "timestamp": time.time(),
+    }
+
+
+def web_list_pages_tool() -> str:
+    """
+    List all web pages that have been scraped and stored during the current session.
+
+    Pages are accumulated automatically whenever web_extract_tool or
+    web_crawl_tool successfully retrieves content.
+
+    Returns:
+        str: JSON string with the following structure:
+             {
+                 "total": int,
+                 "pages": [
+                     {
+                         "url": str,
+                         "title": str,
+                         "content_length": int,
+                         "timestamp": float  # Unix epoch seconds
+                     },
+                     ...
+                 ]
+             }
+    """
+    pages = [
+        {
+            "url": p["url"],
+            "title": p["title"],
+            "content_length": len(p["content"]),
+            "timestamp": p["timestamp"],
+        }
+        for p in _page_cache.values()
+    ]
+    # Most-recently scraped first
+    pages.sort(key=lambda x: x["timestamp"], reverse=True)
+    return json.dumps({"total": len(pages), "pages": pages}, indent=2, ensure_ascii=False)
+
+
+def web_search_pages_tool(query: str) -> str:
+    """
+    Search over web pages that have been scraped and stored during the current session.
+
+    Performs a case-insensitive keyword search over stored page content and
+    returns matching pages with a short excerpt showing the surrounding context
+    for the first keyword hit.
+
+    Use web_list_pages_tool first to see which pages are available.
+
+    Args:
+        query (str): One or more keywords to search for (space-separated).
+
+    Returns:
+        str: JSON string with the following structure:
+             {
+                 "total": int,
+                 "query": str,
+                 "matches": [
+                     {
+                         "url": str,
+                         "title": str,
+                         "hit_count": int,
+                         "excerpt": str   # ~450-char snippet around first match
+                     },
+                     ...
+                 ]
+             }
+             If no pages have been stored yet, "message" explains how to populate
+             the cache.
+    """
+    if not _page_cache:
+        return json.dumps(
+            {
+                "total": 0,
+                "query": query,
+                "matches": [],
+                "message": (
+                    "No pages stored yet. "
+                    "Use web_extract_tool or web_crawl_tool to scrape pages first, "
+                    "then call web_search_pages_tool to search over them."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    keywords = [kw for kw in query.lower().split() if kw]
+    if not keywords:
+        return json.dumps({"total": 0, "query": query, "matches": []}, ensure_ascii=False)
+
+    matches = []
+    for page in _page_cache.values():
+        content = page["content"]
+        content_lower = content.lower()
+
+        # Skip pages that contain none of the keywords
+        if not any(kw in content_lower for kw in keywords):
+            continue
+
+        # Locate the earliest keyword hit so we can build a context excerpt
+        first_pos = -1
+        for kw in keywords:
+            pos = content_lower.find(kw)
+            if pos != -1 and (first_pos == -1 or pos < first_pos):
+                first_pos = pos
+
+        excerpt = ""
+        if first_pos != -1:
+            start = max(0, first_pos - 150)
+            end = min(len(content), first_pos + 300)
+            prefix = "..." if start > 0 else ""
+            suffix = "..." if end < len(content) else ""
+            excerpt = prefix + content[start:end].strip() + suffix
+
+        hit_count = sum(content_lower.count(kw) for kw in keywords)
+        matches.append(
+            {
+                "url": page["url"],
+                "title": page["title"],
+                "hit_count": hit_count,
+                "excerpt": excerpt,
+            }
+        )
+
+    # Most relevant (highest hit count) first
+    matches.sort(key=lambda x: x["hit_count"], reverse=True)
+    return json.dumps(
+        {"total": len(matches), "query": query, "matches": matches},
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 # Convenience function to check if API key is available
